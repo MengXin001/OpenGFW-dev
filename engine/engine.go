@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"runtime"
-	"sync"
 
 	"github.com/apernet/OpenGFW/io"
 	"github.com/apernet/OpenGFW/ruleset"
@@ -35,6 +34,7 @@ func NewEngine(config Config) (Engine, error) {
 			Ruleset:                    config.Ruleset,
 			TCPMaxBufferedPagesTotal:   config.WorkerTCPMaxBufferedPagesTotal,
 			TCPMaxBufferedPagesPerConn: config.WorkerTCPMaxBufferedPagesPerConn,
+			TCPTimeout:                 config.WorkerTCPTimeout,
 			UDPMaxStreams:              config.WorkerUDPMaxStreams,
 		})
 		if err != nil {
@@ -58,16 +58,17 @@ func (e *engine) UpdateRuleset(r ruleset.Ruleset) error {
 }
 
 func (e *engine) Run(ctx context.Context) error {
+	workerCtx, workerCancel := context.WithCancel(ctx)
+	defer workerCancel() // Stop workers
+
+	// Register IO shutdown
 	ioCtx, ioCancel := context.WithCancel(ctx)
-	var workers sync.WaitGroup
-	defer func() {
-		ioCancel()
-		workers.Wait()
-	}()
+	e.io.SetCancelFunc(ioCancel)
+	defer ioCancel() // Stop IO
 
 	// Start workers
 	for _, w := range e.workers {
-		workers.Go(func() { w.Run(ioCtx) })
+		go w.Run(workerCtx)
 	}
 
 	// Register IO callback
@@ -89,6 +90,8 @@ func (e *engine) Run(ctx context.Context) error {
 		return err
 	case <-ctx.Done():
 		return nil
+	case <-ioCtx.Done():
+		return nil
 	}
 }
 
@@ -106,9 +109,11 @@ func (e *engine) dispatch(p io.Packet) bool {
 		_ = e.io.SetVerdict(p, io.VerdictAcceptStream, nil)
 		return true
 	}
+	// Convert to gopacket.Packet
+	packet := gopacket.NewPacket(data, layerType, gopacket.DecodeOptions{Lazy: true, NoCopy: true})
+	packet.Metadata().Timestamp = p.Timestamp()
 	// Load balance by stream ID
 	index := p.StreamID() % uint32(len(e.workers))
-	packet := gopacket.NewPacket(data, layerType, gopacket.DecodeOptions{Lazy: true, NoCopy: true})
 	e.workers[index].Feed(&workerPacket{
 		StreamID: p.StreamID(),
 		Packet:   packet,

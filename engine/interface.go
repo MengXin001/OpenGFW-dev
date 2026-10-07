@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"time"
 
 	"github.com/apernet/OpenGFW/io"
 	"github.com/apernet/OpenGFW/ruleset"
@@ -25,6 +26,7 @@ type Config struct {
 	WorkerQueueSize                  int
 	WorkerTCPMaxBufferedPagesTotal   int
 	WorkerTCPMaxBufferedPagesPerConn int
+	WorkerTCPTimeout                 time.Duration
 	WorkerUDPMaxStreams              int
 }
 
@@ -36,6 +38,7 @@ type Logger interface {
 	TCPStreamNew(workerID int, info ruleset.StreamInfo)
 	TCPStreamPropUpdate(info ruleset.StreamInfo, close bool)
 	TCPStreamAction(info ruleset.StreamInfo, action ruleset.Action, noMatch bool)
+	TCPFlush(workerID, flushed, closed int)
 
 	UDPStreamNew(workerID int, info ruleset.StreamInfo)
 	UDPStreamPropUpdate(info ruleset.StreamInfo, close bool)
@@ -43,7 +46,7 @@ type Logger interface {
 
 	ModifyError(info ruleset.StreamInfo, err error)
 
-	AnalyzerDebugf(streamID int64, name string, format string, args ...any)
-	AnalyzerInfof(streamID int64, name string, format string, args ...any)
-	AnalyzerErrorf(streamID int64, name string, format string, args ...any)
+	AnalyzerDebugf(streamID int64, name string, format string, args ...interface{})
+	AnalyzerInfof(streamID int64, name string, format string, args ...interface{})
+	AnalyzerErrorf(streamID int64, name string, format string, args ...interface{})
 }

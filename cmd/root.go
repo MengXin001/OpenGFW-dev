@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/apernet/OpenGFW/analyzer"
 	"github.com/apernet/OpenGFW/analyzer/tcp"
@@ -16,6 +17,7 @@ import (
 	"github.com/apernet/OpenGFW/modifier"
 	modUDP "github.com/apernet/OpenGFW/modifier/udp"
 	"github.com/apernet/OpenGFW/ruleset"
+	"github.com/apernet/OpenGFW/ruleset/builtins/geo"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -41,6 +43,7 @@ var logger *zap.Logger
 // Flags
 var (
 	cfgFile   string
+	pcapFile  string
 	logLevel  string
 	logFormat string
 )
@@ -116,6 +119,7 @@ func init() {
 
 func initFlags() {
 	rootCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "", "config file")
+	rootCmd.PersistentFlags().StringVarP(&pcapFile, "pcap", "p", "", "pcap file (optional)")
 	rootCmd.PersistentFlags().StringVarP(&logLevel, "log-level", "l", envOrDefaultString(appLogLevelEnv, "info"), "log level")
 	rootCmd.PersistentFlags().StringVarP(&logFormat, "log-format", "f", envOrDefaultString(appLogFormatEnv, "console"), "log format")
 }
@@ -165,22 +169,33 @@ type cliConfig struct {
 	IO      cliConfigIO      `mapstructure:"io"`
 	Workers cliConfigWorkers `mapstructure:"workers"`
 	Ruleset cliConfigRuleset `mapstructure:"ruleset"`
+	Replay  cliConfigReplay  `mapstructure:"replay"`
 }
 
 type cliConfigIO struct {
-	QueueSize   uint32 `mapstructure:"queueSize"`
-	ReadBuffer  int    `mapstructure:"rcvBuf"`
-	WriteBuffer int    `mapstructure:"sndBuf"`
-	Local       bool   `mapstructure:"local"`
-	RST         bool   `mapstructure:"rst"`
+	QueueSize      uint32  `mapstructure:"queueSize"`
+	QueueNum       *uint16 `mapstructure:"queueNum"`
+	Table          string  `mapstructure:"table"`
+	ConnMarkAccept uint32  `mapstructure:"connMarkAccept"`
+	ConnMarkDrop   uint32  `mapstructure:"connMarkDrop"`
+
+	ReadBuffer  int  `mapstructure:"rcvBuf"`
+	WriteBuffer int  `mapstructure:"sndBuf"`
+	Local       bool `mapstructure:"local"`
+	RST         bool `mapstructure:"rst"`
+}
+
+type cliConfigReplay struct {
+	Realtime bool `mapstructure:"realtime"`
 }
 
 type cliConfigWorkers struct {
-	Count                      int `mapstructure:"count"`
-	QueueSize                  int `mapstructure:"queueSize"`
-	TCPMaxBufferedPagesTotal   int `mapstructure:"tcpMaxBufferedPagesTotal"`
-	TCPMaxBufferedPagesPerConn int `mapstructure:"tcpMaxBufferedPagesPerConn"`
-	UDPMaxStreams              int `mapstructure:"udpMaxStreams"`
+	Count                      int           `mapstructure:"count"`
+	QueueSize                  int           `mapstructure:"queueSize"`
+	TCPMaxBufferedPagesTotal   int           `mapstructure:"tcpMaxBufferedPagesTotal"`
+	TCPMaxBufferedPagesPerConn int           `mapstructure:"tcpMaxBufferedPagesPerConn"`
+	TCPTimeout                 time.Duration `mapstructure:"tcpTimeout"`
+	UDPMaxStreams              int           `mapstructure:"udpMaxStreams"`
 }
 
 type cliConfigRuleset struct {
@@ -194,17 +209,35 @@ func (c *cliConfig) fillLogger(config *engine.Config) error {
 }
 
 func (c *cliConfig) fillIO(config *engine.Config) error {
-	nfio, err := io.NewNFQueuePacketIO(io.NFQueuePacketIOConfig{
-		QueueSize:   c.IO.QueueSize,
-		ReadBuffer:  c.IO.ReadBuffer,
-		WriteBuffer: c.IO.WriteBuffer,
-		Local:       c.IO.Local,
-		RST:         c.IO.RST,
-	})
+	var ioImpl io.PacketIO
+	var err error
+	if pcapFile != "" {
+		// Setup IO for pcap file replay
+		logger.Info("replaying from pcap file", zap.String("pcap file", pcapFile))
+		ioImpl, err = io.NewPcapPacketIO(io.PcapPacketIOConfig{
+			PcapFile: pcapFile,
+			Realtime: c.Replay.Realtime,
+		})
+	} else {
+		// Setup IO for nfqueue
+		ioImpl, err = io.NewNFQueuePacketIO(io.NFQueuePacketIOConfig{
+			QueueSize:      c.IO.QueueSize,
+			QueueNum:       c.IO.QueueNum,
+			Table:          c.IO.Table,
+			ConnMarkAccept: c.IO.ConnMarkAccept,
+			ConnMarkDrop:   c.IO.ConnMarkDrop,
+
+			ReadBuffer:  c.IO.ReadBuffer,
+			WriteBuffer: c.IO.WriteBuffer,
+			Local:       c.IO.Local,
+			RST:         c.IO.RST,
+		})
+	}
+
 	if err != nil {
 		return configError{Field: "io", Err: err}
 	}
-	config.IO = nfio
+	config.IO = ioImpl
 	return nil
 }
 
@@ -213,6 +246,7 @@ func (c *cliConfig) fillWorkers(config *engine.Config) error {
 	config.WorkerQueueSize = c.Workers.QueueSize
 	config.WorkerTCPMaxBufferedPagesTotal = c.Workers.TCPMaxBufferedPagesTotal
 	config.WorkerTCPMaxBufferedPagesPerConn = c.Workers.TCPMaxBufferedPagesPerConn
+	config.WorkerTCPTimeout = c.Workers.TCPTimeout
 	config.WorkerUDPMaxStreams = c.Workers.UDPMaxStreams
 	return nil
 }
@@ -256,8 +290,7 @@ func runMain(cmd *cobra.Command, args []string) {
 	}
 	rsConfig := &ruleset.BuiltinConfig{
 		Logger:               &rulesetLogger{},
-		GeoSiteFilename:      config.Ruleset.GeoSite,
-		GeoIpFilename:        config.Ruleset.GeoIp,
+		GeoMatcher:           geo.NewGeoMatcher(config.Ruleset.GeoSite, config.Ruleset.GeoIp),
 		ProtectedDialContext: engineConfig.IO.ProtectedDialContext,
 	}
 	rs, err := ruleset.CompileExprRules(rawRs, analyzers, modifiers, rsConfig)
@@ -340,12 +373,26 @@ func (l *engineLogger) TCPStreamPropUpdate(info ruleset.StreamInfo, close bool) 
 }
 
 func (l *engineLogger) TCPStreamAction(info ruleset.StreamInfo, action ruleset.Action, noMatch bool) {
-	logger.Info("TCP stream action",
-		zap.Int64("id", info.ID),
-		zap.String("src", info.SrcString()),
-		zap.String("dst", info.DstString()),
-		zap.String("action", action.String()),
-		zap.Bool("noMatch", noMatch))
+	if noMatch {
+		logger.Debug("TCP stream no match",
+			zap.Int64("id", info.ID),
+			zap.String("src", info.SrcString()),
+			zap.String("dst", info.DstString()),
+			zap.String("action", action.String()))
+	} else {
+		logger.Info("TCP stream action",
+			zap.Int64("id", info.ID),
+			zap.String("src", info.SrcString()),
+			zap.String("dst", info.DstString()),
+			zap.String("action", action.String()))
+	}
+}
+
+func (l *engineLogger) TCPFlush(workerID, flushed, closed int) {
+	logger.Debug("TCP flush",
+		zap.Int("workerID", workerID),
+		zap.Int("flushed", flushed),
+		zap.Int("closed", closed))
 }
 
 func (l *engineLogger) UDPStreamNew(workerID int, info ruleset.StreamInfo) {
@@ -366,12 +413,19 @@ func (l *engineLogger) UDPStreamPropUpdate(info ruleset.StreamInfo, close bool) 
 }
 
 func (l *engineLogger) UDPStreamAction(info ruleset.StreamInfo, action ruleset.Action, noMatch bool) {
-	logger.Info("UDP stream action",
-		zap.Int64("id", info.ID),
-		zap.String("src", info.SrcString()),
-		zap.String("dst", info.DstString()),
-		zap.String("action", action.String()),
-		zap.Bool("noMatch", noMatch))
+	if noMatch {
+		logger.Debug("UDP stream no match",
+			zap.Int64("id", info.ID),
+			zap.String("src", info.SrcString()),
+			zap.String("dst", info.DstString()),
+			zap.String("action", action.String()))
+	} else {
+		logger.Info("UDP stream action",
+			zap.Int64("id", info.ID),
+			zap.String("src", info.SrcString()),
+			zap.String("dst", info.DstString()),
+			zap.String("action", action.String()))
+	}
 }
 
 func (l *engineLogger) ModifyError(info ruleset.StreamInfo, err error) {
@@ -382,21 +436,21 @@ func (l *engineLogger) ModifyError(info ruleset.StreamInfo, err error) {
 		zap.Error(err))
 }
 
-func (l *engineLogger) AnalyzerDebugf(streamID int64, name string, format string, args ...any) {
+func (l *engineLogger) AnalyzerDebugf(streamID int64, name string, format string, args ...interface{}) {
 	logger.Debug("analyzer debug message",
 		zap.Int64("id", streamID),
 		zap.String("name", name),
 		zap.String("msg", fmt.Sprintf(format, args...)))
 }
 
-func (l *engineLogger) AnalyzerInfof(streamID int64, name string, format string, args ...any) {
+func (l *engineLogger) AnalyzerInfof(streamID int64, name string, format string, args ...interface{}) {
 	logger.Info("analyzer info message",
 		zap.Int64("id", streamID),
 		zap.String("name", name),
 		zap.String("msg", fmt.Sprintf(format, args...)))
 }
 
-func (l *engineLogger) AnalyzerErrorf(streamID int64, name string, format string, args ...any) {
+func (l *engineLogger) AnalyzerErrorf(streamID int64, name string, format string, args ...interface{}) {
 	logger.Error("analyzer error message",
 		zap.Int64("id", streamID),
 		zap.String("name", name),
