@@ -36,6 +36,9 @@ func NewEngine(config Config) (Engine, error) {
 			TCPMaxBufferedPagesPerConn: config.WorkerTCPMaxBufferedPagesPerConn,
 			TCPTimeout:                 config.WorkerTCPTimeout,
 			UDPMaxStreams:              config.WorkerUDPMaxStreams,
+			Decap:                      config.WorkerDecap,
+			DecapMaxDepth:              config.WorkerDecapMaxDepth,
+			DecapMaxInnerPacketSize:    config.WorkerDecapMaxInnerPacketSize,
 		})
 		if err != nil {
 			return nil, err
@@ -100,7 +103,14 @@ func (e *engine) dispatch(p io.Packet) bool {
 	data := p.Data()
 	ipVersion := data[0] >> 4
 	var layerType gopacket.LayerType
-	if ipVersion == 4 {
+	if p.LinkType() != layers.LinkTypeRaw {
+		// Link layer frame, only the decapsulation can reach the network layer
+		if e.workers[0].decap == nil {
+			_ = e.io.SetVerdict(p, io.VerdictAcceptStream, nil)
+			return true
+		}
+		layerType = p.LinkType().LayerType()
+	} else if ipVersion == 4 {
 		layerType = layers.LayerTypeIPv4
 	} else if ipVersion == 6 {
 		layerType = layers.LayerTypeIPv6
@@ -117,6 +127,7 @@ func (e *engine) dispatch(p io.Packet) bool {
 	e.workers[index].Feed(&workerPacket{
 		StreamID: p.StreamID(),
 		Packet:   packet,
+		LinkType: p.LinkType(),
 		SetVerdict: func(v io.Verdict, b []byte) error {
 			return e.io.SetVerdict(p, v, b)
 		},

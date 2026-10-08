@@ -33,6 +33,7 @@ var errInvalidModifier = errors.New("invalid modifier")
 type udpContext struct {
 	Verdict udpVerdict
 	Packet  []byte
+	Encap   analyzer.PropMap
 }
 
 type udpStreamFactory struct {
@@ -55,6 +56,9 @@ func (f *udpStreamFactory) New(ipFlow, udpFlow gopacket.Flow, udp *layers.UDP, u
 		SrcPort:  uint16(udp.SrcPort),
 		DstPort:  uint16(udp.DstPort),
 		Props:    make(analyzer.CombinedPropMap),
+	}
+	if uc.Encap != nil {
+		info.Props["encap"] = uc.Encap
 	}
 	f.Logger.UDPStreamNew(f.WorkerID, info)
 	f.RulesetMutex.RLock()

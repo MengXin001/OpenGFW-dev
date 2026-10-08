@@ -196,6 +196,10 @@ type cliConfigWorkers struct {
 	TCPMaxBufferedPagesPerConn int           `mapstructure:"tcpMaxBufferedPagesPerConn"`
 	TCPTimeout                 time.Duration `mapstructure:"tcpTimeout"`
 	UDPMaxStreams              int           `mapstructure:"udpMaxStreams"`
+
+	Decap                      bool          `mapstructure:"decap"`
+	DecapMaxDepth              int           `mapstructure:"decapMaxDepth"`
+	DecapMaxInnerPacketSize    int           `mapstructure:"decapMaxInnerPacketSize"`
 }
 
 type cliConfigRuleset struct {
@@ -248,6 +252,9 @@ func (c *cliConfig) fillWorkers(config *engine.Config) error {
 	config.WorkerTCPMaxBufferedPagesPerConn = c.Workers.TCPMaxBufferedPagesPerConn
 	config.WorkerTCPTimeout = c.Workers.TCPTimeout
 	config.WorkerUDPMaxStreams = c.Workers.UDPMaxStreams
+	config.WorkerDecap = c.Workers.Decap
+	config.WorkerDecapMaxDepth = c.Workers.DecapMaxDepth
+	config.WorkerDecapMaxInnerPacketSize = c.Workers.DecapMaxInnerPacketSize
 	return nil
 }
 

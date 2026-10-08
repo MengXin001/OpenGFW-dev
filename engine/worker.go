@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/apernet/OpenGFW/analyzer"
 	"github.com/apernet/OpenGFW/io"
 	"github.com/apernet/OpenGFW/ruleset"
 
@@ -26,6 +27,7 @@ const (
 type workerPacket struct {
 	StreamID   uint32
 	Packet     gopacket.Packet
+	LinkType   layers.LinkType
 	SetVerdict func(io.Verdict, []byte) error
 }
 
@@ -33,6 +35,7 @@ type worker struct {
 	id         int
 	packetChan chan *workerPacket
 	logger     Logger
+	decap      *decapDecoder
 
 	tcpStreamFactory *tcpStreamFactory
 	tcpStreamPool    *reassembly.StreamPool
@@ -54,6 +57,9 @@ type workerConfig struct {
 	TCPMaxBufferedPagesPerConn int
 	TCPTimeout                 time.Duration
 	UDPMaxStreams              int
+	Decap                      bool
+	DecapMaxDepth              int
+	DecapMaxInnerPacketSize    int
 }
 
 func (c *workerConfig) fillDefaults() {
@@ -71,6 +77,12 @@ func (c *workerConfig) fillDefaults() {
 	}
 	if c.UDPMaxStreams <= 0 {
 		c.UDPMaxStreams = defaultUDPMaxStreams
+	}
+	if c.DecapMaxDepth <= 0 {
+		c.DecapMaxDepth = defaultDecapMaxDepth
+	}
+	if c.DecapMaxInnerPacketSize <= 0 {
+		c.DecapMaxInnerPacketSize = defaultDecapMaxInnerPacketSize
 	}
 }
 
@@ -100,10 +112,16 @@ func newWorker(config workerConfig) (*worker, error) {
 	if err != nil {
 		return nil, err
 	}
+	decap := &decapDecoder{
+		enabled:            config.Decap,
+		maxDepth:           config.DecapMaxDepth,
+		maxInnerPacketSize: config.DecapMaxInnerPacketSize,
+	}
 	return &worker{
 		id:                 config.ID,
 		packetChan:         make(chan *workerPacket, config.ChanSize),
 		logger:             config.Logger,
+		decap:              decap,
 		tcpStreamFactory:   tcpSF,
 		tcpStreamPool:      tcpStreamPool,
 		tcpAssembler:       tcpAssembler,
@@ -134,7 +152,7 @@ func (w *worker) Run(ctx context.Context) {
 				// Closed
 				return
 			}
-			v, b := w.handle(wPkt.StreamID, wPkt.Packet)
+			v, b := w.handle(wPkt.StreamID, wPkt.Packet, wPkt.LinkType)
 			_ = wPkt.SetVerdict(v, b)
 		case <-tcpFlushTicker.C:
 			w.flushTCP(w.tcpTimeout)
@@ -149,7 +167,26 @@ func (w *worker) UpdateRuleset(r ruleset.Ruleset) error {
 	return w.udpStreamFactory.UpdateRuleset(r)
 }
 
-func (w *worker) handle(streamID uint32, p gopacket.Packet) (io.Verdict, []byte) {
+func (w *worker) handle(streamID uint32, p gopacket.Packet, linkType layers.LinkType) (io.Verdict, []byte) {
+	if w.decap.enabled {
+		result, err := w.decap.Decode(p.Data(), linkType)
+		if err == nil && result.Encap != nil {
+			*result.Packet.Metadata() = *p.Metadata()
+			v, b := w.handlePacket(streamID, result.Packet, result.Encap)
+			// Verdicts apply to the outer packet, which may carry other streams
+			switch v {
+			case io.VerdictAcceptModify, io.VerdictAcceptStream:
+				return io.VerdictAccept, nil
+			case io.VerdictDropStream:
+				return io.VerdictDrop, nil
+			}
+			return v, b
+		}
+	}
+	return w.handlePacket(streamID, p, nil)
+}
+
+func (w *worker) handlePacket(streamID uint32, p gopacket.Packet, encap analyzer.PropMap) (io.Verdict, []byte) {
 	netLayer, trLayer := p.NetworkLayer(), p.TransportLayer()
 	if netLayer == nil || trLayer == nil {
 		// Invalid packet
@@ -158,10 +195,14 @@ func (w *worker) handle(streamID uint32, p gopacket.Packet) (io.Verdict, []byte)
 	ipFlow := netLayer.NetworkFlow()
 	switch tr := trLayer.(type) {
 	case *layers.TCP:
-		return w.handleTCP(ipFlow, p.Metadata(), tr), nil
+		return w.handleTCP(ipFlow, p.Metadata(), tr, encap), nil
 	case *layers.UDP:
-		v, modPayload := w.handleUDP(streamID, ipFlow, tr)
-		if v == io.VerdictAcceptModify && modPayload != nil {
+		if encap != nil {
+			streamID = innerStreamID(streamID, ipFlow, tr.TransportFlow())
+		}
+		v, modPayload := w.handleUDP(streamID, ipFlow, tr, encap)
+		// Modifying encapsulated packets is not currently supported
+		if v == io.VerdictAcceptModify && modPayload != nil && encap == nil {
 			tr.Payload = modPayload
 			_ = tr.SetNetworkLayerForChecksum(netLayer)
 			_ = w.modSerializeBuffer.Clear()
@@ -183,10 +224,11 @@ func (w *worker) handle(streamID uint32, p gopacket.Packet) (io.Verdict, []byte)
 	}
 }
 
-func (w *worker) handleTCP(ipFlow gopacket.Flow, pMeta *gopacket.PacketMetadata, tcp *layers.TCP) io.Verdict {
+func (w *worker) handleTCP(ipFlow gopacket.Flow, pMeta *gopacket.PacketMetadata, tcp *layers.TCP, encap analyzer.PropMap) io.Verdict {
 	ctx := &tcpContext{
 		PacketMetadata: pMeta,
 		Verdict:        tcpVerdictAccept,
+		Encap:          encap,
 	}
 	w.tcpAssembler.AssembleWithContext(ipFlow, tcp, ctx)
 	return io.Verdict(ctx.Verdict)
@@ -197,9 +239,10 @@ func (w *worker) flushTCP(timeout time.Duration) {
 	w.logger.TCPFlush(w.id, flushed, closed)
 }
 
-func (w *worker) handleUDP(streamID uint32, ipFlow gopacket.Flow, udp *layers.UDP) (io.Verdict, []byte) {
+func (w *worker) handleUDP(streamID uint32, ipFlow gopacket.Flow, udp *layers.UDP, encap analyzer.PropMap) (io.Verdict, []byte) {
 	ctx := &udpContext{
 		Verdict: udpVerdictAccept,
+		Encap:   encap,
 	}
 	w.udpStreamManager.MatchWithContext(streamID, ipFlow, udp, ctx)
 	return io.Verdict(ctx.Verdict), ctx.Packet

@@ -4,6 +4,8 @@ import (
 	"context"
 	"net"
 	"time"
+
+	"github.com/google/gopacket/layers"
 )
 
 type Verdict int
@@ -27,8 +29,10 @@ type Packet interface {
 	StreamID() uint32
 	// Timestamp is the time the packet was received.
 	Timestamp() time.Time
-	// Data is the raw packet data, starting with the IP header.
+	// Data is the raw packet data, starting with the IP header if LinkType is LinkTypeRaw.
 	Data() []byte
+	// LinkType is the link layer type of Data.
+	LinkType() layers.LinkType
 }
 
 // PacketCallback is called for each packet received.

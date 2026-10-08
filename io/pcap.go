@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcapgo"
 )
 
@@ -65,10 +66,16 @@ func (p *pcapPacketIO) Register(ctx context.Context, cb PacketCallback) error {
 				sort.Strings(endpoints)
 				id := crc32.Checksum([]byte(strings.Join(endpoints, ",")), crc32.IEEETable)
 
+				// Keep the IP packet, unless it is encapsulated in a link layer frame
+				data, linkType := packet.Data(), p.pcap.LinkType()
+				if isPlainIP(packet) {
+					data, linkType = packet.LinkLayer().LayerPayload(), layers.LinkTypeRaw
+				}
 				cb(&pcapPacket{
 					streamID:  id,
 					timestamp: packet.Metadata().Timestamp,
-					data:      packet.LinkLayer().LayerPayload(),
+					data:      data,
+					linkType:  linkType,
 				}, nil)
 			}
 		}
@@ -79,6 +86,10 @@ func (p *pcapPacketIO) Register(ctx context.Context, cb PacketCallback) error {
 	}()
 
 	return nil
+}
+
+func isPlainIP(packet gopacket.Packet) bool {
+	return packet.LinkLayer() != nil && len(packet.Layers()) > 1 && packet.Layers()[1] == packet.NetworkLayer()
 }
 
 // A normal dialer is sufficient as pcap IO does not mess up with the networking
@@ -121,6 +132,7 @@ type pcapPacket struct {
 	streamID  uint32
 	timestamp time.Time
 	data      []byte
+	linkType  layers.LinkType
 }
 
 func (p *pcapPacket) StreamID() uint32 {
@@ -133,4 +145,8 @@ func (p *pcapPacket) Timestamp() time.Time {
 
 func (p *pcapPacket) Data() []byte {
 	return p.data
+}
+
+func (p *pcapPacket) LinkType() layers.LinkType {
+	return p.linkType
 }

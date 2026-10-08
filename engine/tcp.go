@@ -28,6 +28,7 @@ const (
 type tcpContext struct {
 	*gopacket.PacketMetadata
 	Verdict tcpVerdict
+	Encap   analyzer.PropMap
 }
 
 func (ctx *tcpContext) GetCaptureInfo() gopacket.CaptureInfo {
@@ -54,6 +55,9 @@ func (f *tcpStreamFactory) New(ipFlow, tcpFlow gopacket.Flow, tcp *layers.TCP, a
 		SrcPort:  uint16(tcp.SrcPort),
 		DstPort:  uint16(tcp.DstPort),
 		Props:    make(analyzer.CombinedPropMap),
+	}
+	if encap := ac.(*tcpContext).Encap; encap != nil {
+		info.Props["encap"] = encap
 	}
 	f.Logger.TCPStreamNew(f.WorkerID, info)
 	f.RulesetMutex.RLock()

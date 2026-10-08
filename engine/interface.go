@@ -28,6 +28,9 @@ type Config struct {
 	WorkerTCPMaxBufferedPagesPerConn int
 	WorkerTCPTimeout                 time.Duration
 	WorkerUDPMaxStreams              int
+	WorkerDecap                      bool
+	WorkerDecapMaxDepth              int
+	WorkerDecapMaxInnerPacketSize    int
 }
 
 // Logger is the combined logging interface for the engine, workers and analyzers.

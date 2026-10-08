@@ -210,7 +210,7 @@ func streamInfoToExprEnv(info StreamInfo) map[string]any {
 
 func isBuiltInAnalyzer(name string) bool {
 	switch name {
-	case "id", "proto", "ip", "port":
+	case "id", "proto", "ip", "port", "encap":
 		return true
 	default:
 		return false

@@ -14,6 +14,7 @@ import (
 
 	"github.com/coreos/go-iptables/iptables"
 	"github.com/florianl/go-nfqueue"
+	"github.com/google/gopacket/layers"
 	"github.com/mdlayher/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -372,6 +373,10 @@ func (p *nfqueuePacket) Timestamp() time.Time {
 
 func (p *nfqueuePacket) Data() []byte {
 	return p.data
+}
+
+func (p *nfqueuePacket) LinkType() layers.LinkType {
+	return layers.LinkTypeRaw
 }
 
 func okBoolToInt(ok bool) int {
